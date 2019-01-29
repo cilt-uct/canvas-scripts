@@ -7,6 +7,9 @@
 *.pm.tdy
 *.bs
 
+tmp/*
+done/*
+
 # Devel::Cover
 cover_db/
 
