@@ -24,9 +24,11 @@ use File::Path qw(make_path);
 require '/usr/local/sakaiconfig/vula_auth.pl';
 
 my $production = 0;
+my $import = 0;
+my $diff = 0;
 my $help = 0;
 
-GetOptions ('prod' => \$production, 'help' => \$help)
+GetOptions ('prod' => \$production, 'import' => \$import, 'use_diff' => \$diff, 'help' => \$help)
   or die("Error in command line arguments\n");
 
 if ($help) {
@@ -34,6 +36,9 @@ if ($help) {
 
 Options:
   --prod (Run with production settings)
+  --import (Import into Canvas)
+  --diff (Use Diffing mode - mark students as 'inactive')
+        by default marks objects as "deleted" when they are not included for an import, but enrollments can be marked as 'completed' or 'inactive' if the diffing_drop_status is passed.
   --help (This view)
 
 HELPTEXT
@@ -61,12 +66,12 @@ my $tmp_zip_file = $script_folder_tmp ."import.zip";
 my $start = time();
 
 my $db_live = DBI->connect( "DBI:mysql:database=$dbname;host=$dbhost;port=3306", $username, $password )
-      || die "Could not connect to database: $DBI::errstr";
+	  || die "Could not connect to database: $DBI::errstr";
 
 $db_live->{AutoCommit} = 0;  # enable transactions, if possible
 
 #------------------------------------------------------------------------
-print "Running on $host (". ($production ? "Production" : "Test") ."):\n";
+print "Running on $host (". ($production ? "Production" : "Test") .") [$import] [$diff]:\n";
 
 # Read in Active Canvas courses which we want enrollment information for
 my $handle;
@@ -99,7 +104,8 @@ my $sql = "select `enroll`.user_id, `user`.`FIRST_NAME`, `user`.`LAST_NAME`, `us
     left join SAKAI_USER_ID_MAP `map` on `enroll`.`USER_ID` = `map`.`EID`
     left join SAKAI_USER `user` on `map`.`USER_ID` = `user`.`USER_ID`
     where `course`.ENTERPRISE_ID in ($placeholders)
-    group by `enroll`.user_id";
+    group by `enroll`.user_id, `course`.ENTERPRISE_ID
+    order by `enroll`.user_id";
 
 my $get_students = $db_live->prepare($sql)
     or die "Couldn't get students: " . $db_live->errstr;
@@ -114,11 +120,15 @@ if ($get_students->rows > 0) {
 
     open(my $fh_enrollments, '>', $tmp_enrollment_file) or die "Could not open file '$tmp_enrollment_file' $!";
     print $fh_enrollments "course_id,user_id,role,status\n";
+    my $prev = '';
 
     while (my @data = $get_students->fetchrow_array()) {
 
         # user_id,login_id,first_name,last_name,email,status
-        print $fh_users $data[0],",",$data[0],",",$data[1],",",$data[2],",",$data[3],",active\n";
+        if ($prev ne $data[0]) {
+            print $fh_users $data[0],",",$data[0],",",$data[1],",",$data[2],",",$data[3],",active\n";
+            $prev = $data[0];
+        }
 
         my @main_parts = split(',', $data[4]);
         my @course_codes = grep { index($_, $main_parts[0]) != -1 } @active_courses;
@@ -141,26 +151,40 @@ if ($get_students->rows > 0) {
         die "Could not write zip file: $tmp_zip_file\n";
     }
 
-    # send zip file to SIS import
-    my $ua = LWP::UserAgent->new;
-    my $request = HTTP::Request::Common::POST($uri,
-        Content_Type => 'multipart/form-data',
-        Content => [
-            import_type => 'instructure_csv',
-            extension => 'zip',
-            diffing_data_set_identifier => 'ps:users:enrollment:2019',
-            diffing_drop_status => 'inactive',
-            attachment => [$tmp_zip_file]
-        ]);
-    $request->header("Authorization" => "Bearer $auth_token");
+    if ($import) {
 
-    my $res = $ua->request($request ) ;
-    if ($res->is_success) {
+        my %content = [
+                import_type => 'instructure_csv',
+                extension => 'zip',
+                attachment => [$tmp_zip_file]
+            ];
 
-        move($tmp_zip_file, 
-                $script_folder_done ."import_". strftime('%Y-%m-%d_%H-%M',localtime) ."-". ($production ? "prod" : "test").".zip");
-    } else {
-        die "HTTP get code: ", $res->code, "\n";
+        if ($diff) {
+            $content{'diffing_data_set_identifier'} = 'ps:users:enrollment:2019';
+            $content{'diffing_drop_status'} = 'inactive';
+        }
+
+        # send zip file to SIS import
+        my $ua = LWP::UserAgent->new;
+        my $request = HTTP::Request::Common::POST($uri,
+            Content_Type => 'multipart/form-data',
+            Content => [
+                import_type => 'instructure_csv',
+                extension => 'zip',
+                diffing_data_set_identifier => 'ps:users:enrollment:2019',
+                diffing_drop_status => 'inactive',
+                attachment => [$tmp_zip_file]
+            ]);
+        $request->header("Authorization" => "Bearer $auth_token");
+
+        my $res = $ua->request($request ) ;
+        if ($res->is_success) {
+
+            move($tmp_zip_file,
+                    $script_folder_done ."import_". strftime('%Y-%m-%d_%H-%M',localtime) ."-". ($production ? "prod" : "test").".zip");
+        } else {
+            die "HTTP get code: ", $res->code, "\n";
+        }
     }
 
 } else {
